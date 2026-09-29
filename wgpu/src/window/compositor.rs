@@ -7,6 +7,11 @@ use crate::graphics::{self, Shell, Viewport};
 use crate::settings::{self, Settings};
 use crate::{Engine, Renderer};
 
+#[cfg(not(target_arch = "wasm32"))]
+use std::collections::HashMap;
+#[cfg(not(target_arch = "wasm32"))]
+use std::sync::{Mutex, OnceLock};
+
 /// A window graphics backend for iced powered by `wgpu`.
 pub struct Compositor {
     instance: wgpu::Instance,
@@ -43,6 +48,43 @@ impl From<Error> for graphics::Error {
     }
 }
 
+#[cfg(not(target_arch = "wasm32"))]
+#[derive(Clone, Copy, PartialEq, Eq, Hash)]
+struct AdapterKey {
+    backends: wgpu::Backends,
+    power_preference: wgpu::PowerPreference,
+}
+
+async fn new_instance(settings: &Settings) -> wgpu::Instance {
+    wgpu::util::new_instance_with_webgpu_detection(&wgpu::InstanceDescriptor {
+        backends: settings.backends,
+        flags: if cfg!(feature = "strict-assertions") {
+            wgpu::InstanceFlags::debugging()
+        } else {
+            wgpu::InstanceFlags::empty()
+        },
+        ..Default::default()
+    })
+    .await
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn instances() -> &'static Mutex<HashMap<wgpu::Backends, wgpu::Instance>> {
+    static INSTANCES: OnceLock<
+        Mutex<HashMap<wgpu::Backends, wgpu::Instance>>,
+    > = OnceLock::new();
+
+    INSTANCES.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn adapters() -> &'static Mutex<HashMap<AdapterKey, wgpu::Adapter>> {
+    static ADAPTERS: OnceLock<Mutex<HashMap<AdapterKey, wgpu::Adapter>>> =
+        OnceLock::new();
+
+    ADAPTERS.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
 impl Compositor {
     /// Requests a new [`Compositor`] with the given [`Settings`].
     ///
@@ -52,46 +94,102 @@ impl Compositor {
         compatible_window: Option<W>,
         shell: Shell,
     ) -> Result<Self, Error> {
-        let instance = wgpu::util::new_instance_with_webgpu_detection(
-            &wgpu::InstanceDescriptor {
-                backends: settings.backends,
-                flags: if cfg!(feature = "strict-assertions") {
-                    wgpu::InstanceFlags::debugging()
-                } else {
-                    wgpu::InstanceFlags::empty()
-                },
-                ..Default::default()
-            },
-        )
-        .await;
+        #[cfg(not(target_arch = "wasm32"))]
+        let instance = {
+            let cached = instances()
+                .lock()
+                .expect("Lock instances")
+                .get(&settings.backends)
+                .cloned();
+
+            match cached {
+                Some(instance) => instance,
+                None => {
+                    let instance = new_instance(&settings).await;
+
+                    let _ = instances()
+                        .lock()
+                        .expect("Lock instances")
+                        .insert(settings.backends, instance.clone());
+
+                    instance
+                }
+            }
+        };
+
+        #[cfg(target_arch = "wasm32")]
+        let instance = new_instance(&settings).await;
 
         log::info!("{settings:#?}");
-
-        #[cfg(not(target_arch = "wasm32"))]
-        if log::max_level() >= log::LevelFilter::Info {
-            let available_adapters: Vec<_> = instance
-                .enumerate_adapters(settings.backends)
-                .iter()
-                .map(wgpu::Adapter::get_info)
-                .collect();
-            log::info!("Available adapters: {available_adapters:#?}");
-        }
 
         #[allow(unsafe_code)]
         let compatible_surface = compatible_window
             .and_then(|window| instance.create_surface(window).ok());
 
-        let adapter_options = wgpu::RequestAdapterOptions {
-            power_preference: wgpu::PowerPreference::from_env()
-                .unwrap_or(wgpu::PowerPreference::HighPerformance),
-            compatible_surface: compatible_surface.as_ref(),
-            force_fallback_adapter: false,
-        };
+        let power_preference = wgpu::PowerPreference::from_env()
+            .unwrap_or(wgpu::PowerPreference::HighPerformance);
 
-        let adapter =
-            instance.request_adapter(&adapter_options).await.map_err(
-                |_error| Error::NoAdapterFound(format!("{adapter_options:?}")),
-            )?;
+        #[cfg(not(target_arch = "wasm32"))]
+        let cached_adapter = adapters()
+            .lock()
+            .expect("Lock adapters")
+            .get(&AdapterKey {
+                backends: settings.backends,
+                power_preference,
+            })
+            .cloned()
+            .filter(|adapter| {
+                compatible_surface.as_ref().is_none_or(|surface| {
+                    !surface.get_capabilities(adapter).formats.is_empty()
+                })
+            });
+
+        #[cfg(target_arch = "wasm32")]
+        let cached_adapter: Option<wgpu::Adapter> = None;
+
+        let adapter = match cached_adapter {
+            Some(adapter) => adapter,
+            None => {
+                #[cfg(not(target_arch = "wasm32"))]
+                if log::max_level() >= log::LevelFilter::Info {
+                    let available_adapters: Vec<_> = instance
+                        .enumerate_adapters(settings.backends)
+                        .iter()
+                        .map(wgpu::Adapter::get_info)
+                        .collect();
+                    log::info!(
+                        "Available adapters: {available_adapters:#?}"
+                    );
+                }
+
+                let adapter_options = wgpu::RequestAdapterOptions {
+                    power_preference,
+                    compatible_surface: compatible_surface.as_ref(),
+                    force_fallback_adapter: false,
+                };
+
+                let adapter = instance
+                    .request_adapter(&adapter_options)
+                    .await
+                    .map_err(|_error| {
+                        Error::NoAdapterFound(format!("{adapter_options:?}"))
+                    })?;
+
+                #[cfg(not(target_arch = "wasm32"))]
+                let _ = adapters()
+                    .lock()
+                    .expect("Lock adapters")
+                    .insert(
+                        AdapterKey {
+                            backends: settings.backends,
+                            power_preference,
+                        },
+                        adapter.clone(),
+                    );
+
+                adapter
+            }
+        };
 
         log::info!("Selected: {:#?}", adapter.get_info());
 

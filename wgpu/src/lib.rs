@@ -22,6 +22,7 @@
 )]
 #![cfg_attr(docsrs, feature(doc_cfg))]
 #![allow(missing_docs)]
+#![recursion_limit = "256"]
 pub mod layer;
 pub mod primitive;
 pub mod settings;
